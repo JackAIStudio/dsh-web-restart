@@ -41,6 +41,8 @@ window.__ModuleLoader__.load({
       '.dwr-wait{position:relative;z-index:1;display:flex;flex-direction:column;align-items:center;gap:10px;padding:28px 32px;border-radius:20px;background:var(--dsw-alias-bg-layer-2);box-shadow:var(--dsw-shadow-lv3);color:var(--dsw-alias-label-primary);text-align:center}',
       '.dwr-wait-title{margin:0;font-size:16px;font-weight:600;line-height:24px}',
       '.dwr-wait-sub{margin:0;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}',
+      '.dwr-spinner{width:32px;height:32px;border:3px solid var(--dsw-alias-border-l2, rgba(128,128,128,0.25));border-top-color:var(--dsw-alias-brand-primary, #10b981);border-radius:50%;animation:dwrSpin 0.8s linear infinite;margin-bottom:4px}',
+      '@keyframes dwrSpin{to{transform:rotate(360deg)}}',
       '@media (prefers-reduced-motion: reduce){.dwr-btn,.dwr-action{transition:none}}',
     ].join('')
 
@@ -66,7 +68,8 @@ window.__ModuleLoader__.load({
         cancel: '取消',
         confirm: '仍然重启',
         restarting: '正在重启',
-        restartingSub: '页面会暂时断开，起来后自动刷新。',
+        restartingSub: '后台服务正在重新拉起，请稍候...',
+        readyingSub: '服务已重新就绪，正在等待页面平滑自动重载...',
         failed: '重启失败',
         timeout: '等了太久还没起来。请到终端手动重启宿主。',
         remote: '只能在运行 dsh web 的这台机器上重启。',
@@ -80,7 +83,8 @@ window.__ModuleLoader__.load({
         cancel: 'Cancel',
         confirm: 'Restart anyway',
         restarting: 'Restarting',
-        restartingSub: 'The page will drop; it reloads when the host is back.',
+        restartingSub: 'Backend service is restarting, please wait...',
+        readyingSub: 'Service is back up; verifying main page before auto-reload...',
         failed: 'Restart failed',
         timeout: 'The host did not come back in time. Restart it from a terminal.',
         remote: 'Restart is only available on the machine that is running dsh web.',
@@ -155,17 +159,44 @@ window.__ModuleLoader__.load({
       return new Promise((resolve) => setTimeout(resolve, ms))
     }
 
-    async function waitForNewBoot(previousBootId, t) {
+    async function waitForNewBoot(previousBootId, t, onProgress) {
       const started = Date.now()
+      let newBootConfirmed = false
+
       while (Date.now() - started < TIMEOUT_MS) {
         await sleep(POLL_MS)
+
+        // 第一阶段：探测后端服务进程是否已携新 bootId 重启成功
+        if (!newBootConfirmed) {
+          try {
+            const { response, value } = await readJson(STATUS_ROUTE, { method: 'GET' })
+            if (response.ok && value && value.ok === true && typeof value.bootId === 'string' && value.bootId !== previousBootId) {
+              newBootConfirmed = true
+              if (onProgress) onProgress('readying')
+            }
+          } catch {
+            /* host is down; keep polling */
+          }
+          continue
+        }
+
+        // 第二阶段：核心防线！持续探测主页面根路径 HTML，直到确认返回 200/304 真实就绪
+        // 彻底杜绝在静态服务挂载前盲目 reload 撞上 Chromium 404 导致自动重载失效
         try {
-          const { response, value } = await readJson(STATUS_ROUTE, { method: 'GET' })
-          if (response.ok && value && value.ok === true && typeof value.bootId === 'string' && value.bootId !== previousBootId) {
+          const targetUrl = typeof window !== 'undefined' ? window.location.href : '/'
+          const probe = await fetch(targetUrl, {
+            method: 'GET',
+            cache: 'no-store',
+            credentials: 'same-origin',
+            headers: { accept: 'text/html,*/*' },
+          })
+          if (probe.status === 200 || probe.status === 304) {
+            // 额外缓冲 350ms 确保各中间件路由彻底稳定
+            await sleep(350)
             return true
           }
         } catch {
-          /* host is down; keep polling */
+          /* main HTML page not ready yet; keep polling */
         }
       }
       throw new Error(t.timeout)
@@ -177,6 +208,7 @@ window.__ModuleLoader__.load({
       const cancelRef = React.useRef(null)
       const [open, setOpen] = React.useState(false)
       const [phase, setPhase] = React.useState('idle')
+      const [waitStatus, setWaitStatus] = React.useState('restarting')
       const [error, setError] = React.useState('')
 
       React.useEffect(() => {
@@ -203,6 +235,7 @@ window.__ModuleLoader__.load({
       async function confirmRestart() {
         if (phase === 'restarting') return
         setPhase('restarting')
+        setWaitStatus('restarting')
         setError('')
         try {
           const before = await readJson(STATUS_ROUTE, { method: 'GET' })
@@ -216,7 +249,9 @@ window.__ModuleLoader__.load({
             const code = posted.value && posted.value.code
             throw new Error(code === 'remote-not-supported' ? t.remote : ((posted.value && posted.value.error) || t.failed))
           }
-          await waitForNewBoot(posted.value.bootId || previousBootId, t)
+          await waitForNewBoot(posted.value.bootId || previousBootId, t, (stage) => {
+            setWaitStatus(stage)
+          })
           window.location.reload()
         } catch (err) {
           setPhase('confirm')
@@ -236,8 +271,9 @@ window.__ModuleLoader__.load({
             }),
             phase === 'restarting'
               ? h('div', { className: 'dwr-wait', role: 'status', 'aria-live': 'polite' },
+                h('div', { className: 'dwr-spinner' }),
                 h('p', { className: 'dwr-wait-title' }, t.restarting),
-                h('p', { className: 'dwr-wait-sub' }, t.restartingSub),
+                h('p', { className: 'dwr-wait-sub' }, waitStatus === 'readying' ? t.readyingSub : t.restartingSub),
               )
               : h('div', {
                 className: 'dwr-panel',

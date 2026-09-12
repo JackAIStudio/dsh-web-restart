@@ -1,6 +1,6 @@
 {
   "name": "dsh-web-restart",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Sidebar button that restarts the running dsh web host after a mandatory danger warning.",
   "type": "module",
