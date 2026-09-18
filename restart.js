@@ -259,11 +259,16 @@ function defaultLog(event, detail) {
 }
 
 function defaultSpawn(execPath, args, options) {
+  const isElectron = Boolean(process.versions?.electron) || execPath.includes('Electron') || execPath.includes('JackDSH')
+  const env = {
+    ...process.env,
+    ...(isElectron ? { ELECTRON_RUN_AS_NODE: '1' } : {}),
+  }
   const child = spawn(execPath, args, {
     detached: true,
     stdio: 'ignore',
     windowsHide: true,
-    env: process.env,
+    env,
     cwd: options && options.cwd ? options.cwd : homedir(),
   })
   child.unref()
@@ -331,7 +336,9 @@ export async function runHelper(plan, io = defaultIo()) {
   io.log('helper-decide', { action, portOpen, parentAlive: parentPid ? io.isAlive(parentPid) : false })
 
   if (action === 'spawn') {
-    const pid = io.spawn(plan.execPath, [plan.binPath, ...plan.webArgs], { cwd: plan.cwd })
+    const isElectron = Boolean(process.versions?.electron) || plan.execPath.includes('Electron') || plan.execPath.includes('JackDSH')
+    const spawnArgs = isElectron && !plan.binPath.startsWith('--') ? ['--expose-internals', plan.binPath, ...plan.webArgs] : [plan.binPath, ...plan.webArgs]
+    const pid = io.spawn(plan.execPath, spawnArgs, { cwd: plan.cwd })
     io.log('helper-spawn', { pid })
   }
   return action
