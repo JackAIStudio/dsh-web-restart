@@ -1,5 +1,5 @@
-import { spawn } from 'node:child_process'
-import { appendFileSync, mkdirSync } from 'node:fs'
+import { spawn, spawnSync } from 'node:child_process'
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs'
 import net from 'node:net'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -7,6 +7,90 @@ import { fileURLToPath } from 'node:url'
 
 export const STATUS_ROUTE = '/dsh-web-restart/status'
 export const RESTART_ROUTE = '/dsh-web-restart'
+
+/* ---------------------------------------------------------------------------
+   launchd 感知
+
+   为什么必需：如果本机用 LaunchAgent（KeepAlive=true）托管 `dsh web`，
+   它和我们自己的重启 helper 会**互相打架**——
+   helper 杀掉旧进程并 spawn 新的，launchd 同时也在 2 秒内拉起一个，
+   两个抢同一个端口 → listen EADDRINUSE → launchd 再拉起 → 无限循环。
+   实测日志里 EADDRINUSE 出现了两万多次，还会留下抢不到端口的孤儿进程空转 CPU。
+
+   所以：一旦发现当前服务由 launchd 托管，就把重启交给 launchd（kickstart -k），
+   插件自己**绝不**再 spawn。
+   --------------------------------------------------------------------------- */
+
+const LAUNCH_AGENTS_DIR = join(homedir(), 'Library', 'LaunchAgents')
+
+/** 在 LaunchAgents 里找出「就是启动我们这条命令」的那个服务标签。 */
+export function findLaunchdLabel(argv = process.argv) {
+  if (process.platform !== 'darwin') return null
+  let entries
+  try {
+    entries = readdirSync(LAUNCH_AGENTS_DIR)
+  } catch {
+    return null
+  }
+
+  const wantPort = parseListenPort(argv, process.env)
+  const wantBin = typeof argv[1] === 'string' ? argv[1] : ''
+
+  for (const name of entries) {
+    if (!name.endsWith('.plist')) continue
+    let text
+    try {
+      text = readFileSync(join(LAUNCH_AGENTS_DIR, name), 'utf8')
+    } catch {
+      continue
+    }
+    // 必须同时提到 dsh 和我们的端口，才认为是在托管我们这条命令
+    if (!text.includes('dsh')) continue
+    if (wantPort && !new RegExp(`<string>${wantPort}</string>`).test(text)) continue
+    if (wantBin && !text.includes(wantBin)) continue
+    const labelMatch = text.match(/<key>Label<\/key>\s*<string>([^<]+)<\/string>/)
+    if (!labelMatch) continue
+    return labelMatch[1].trim()
+  }
+  return null
+}
+
+/** 该服务当前是否真的被 launchd 加载着。 */
+export function isLaunchdManaged(label, uid = process.getuid?.() ?? 0) {
+  if (!label) return false
+  try {
+    const out = spawnSync('launchctl', ['print', `gui/${uid}/${label}`], {
+      encoding: 'utf8',
+      timeout: 3000,
+    })
+    return out.status === 0
+  } catch {
+    return false
+  }
+}
+
+/** 让 launchd 杀掉并立刻重启这个服务（不经过我们自己的 helper）。 */
+export function kickstartLaunchd(label, uid = process.getuid?.() ?? 0) {
+  if (!label) return { ok: false, error: 'missing launchd label' }
+  try {
+    const child = spawn('launchctl', ['kickstart', '-k', `gui/${uid}/${label}`], {
+      detached: true,
+      stdio: 'ignore',
+    })
+    child.unref()
+    return { ok: true, label, target: `gui/${uid}/${label}` }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/** 需要重启时优先交给 launchd，返回 null 表示「没有 launchd，走原来的 helper」。 */
+export function launchdRestartPlan(argv = process.argv) {
+  const label = findLaunchdLabel(argv)
+  if (!label) return null
+  if (!isLaunchdManaged(label)) return null
+  return { label, target: `gui/${process.getuid?.() ?? 0}/${label}` }
+}
 
 export function isLoopbackAddress(address) {
   return address === '127.0.0.1'

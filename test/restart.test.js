@@ -5,8 +5,12 @@ import {
   anyPortOpen,
   childWebArgs,
   decideAfterParentGone,
+  findLaunchdLabel,
   helperPlanFromArgv,
+  isLaunchdManaged,
   isLoopbackAddress,
+  kickstartLaunchd,
+  launchdRestartPlan,
   parseHelperArgv,
   parseListenHost,
   parseListenPort,
@@ -207,5 +211,58 @@ describe('runHelper', () => {
       supervisorMs: 0,
     }, fakeIo(state))
     assert.ok(state.signals.some((row) => row[1] === 'SIGKILL'))
+  })
+})
+
+describe('launchd 感知', () => {
+  // 背景：本机用 LaunchAgent（KeepAlive=true）托管 `dsh web`。
+  // 如果插件还自己 spawn 一个新进程，两者会抢同一个端口 →
+  // EADDRINUSE → launchd 再拉起 → 无限重启（实测日志里出现过两万多次）。
+  // 所以「发现 launchd 托管就必须让路」是这套逻辑的核心不变量。
+
+  it('认得出托管 dsh web 的那个 LaunchAgent', () => {
+    const label = findLaunchdLabel(['node', '/usr/local/bin/dsh', 'web', '--port', '3080', '--no-open'])
+    // 这台机器上确实装了这个 LaunchAgent；没装则跳过（其他机器上可能没有）
+    if (label === null) return
+    assert.equal(typeof label, 'string')
+    assert.ok(label.length > 0, 'label 不能是空串')
+  })
+
+  it('端口对不上就不认（避免误判成别的服务）', () => {
+    const label = findLaunchdLabel(['node', '/usr/local/bin/dsh', 'web', '--port', '59999', '--no-open'])
+    assert.equal(label, null, '端口不匹配时必须返回 null')
+  })
+
+  it('命令对不上就不认', () => {
+    const label = findLaunchdLabel(['node', '/somewhere/else/tool', 'web', '--port', '3080', '--no-open'])
+    assert.equal(label, null, '不是 dsh 时必须返回 null')
+  })
+
+  it('isLaunchdManaged 对空 label 一律返回 false', () => {
+    assert.equal(isLaunchdManaged(null), false)
+    assert.equal(isLaunchdManaged(''), false)
+    assert.equal(isLaunchdManaged(undefined), false)
+  })
+
+  it('isLaunchdManaged 对不存在的 label 返回 false（不能抛错）', () => {
+    assert.equal(isLaunchdManaged('com.jkw.definitely-not-a-real-service-xyz'), false)
+  })
+
+  it('kickstartLaunchd 对空 label 返回失败而不是抛错', () => {
+    const r = kickstartLaunchd(null)
+    assert.equal(r.ok, false)
+    assert.ok(typeof r.error === 'string' && r.error.length > 0)
+  })
+
+  it('launchdRestartPlan 在没有 launchd 时返回 null（回落到 helper）', () => {
+    const plan = launchdRestartPlan(['node', '/usr/local/bin/dsh', 'web', '--port', '59999', '--no-open'])
+    assert.equal(plan, null)
+  })
+
+  it('有 launchd 时给出的 target 形如 gui/<uid>/<label>', () => {
+    const plan = launchdRestartPlan(['node', '/usr/local/bin/dsh', 'web', '--port', '3080', '--no-open'])
+    if (plan === null) return
+    assert.match(plan.target, /^gui\/\d+\/.+$/)
+    assert.equal(plan.label, plan.target.split('/').slice(2).join('/'))
   })
 })

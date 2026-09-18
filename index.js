@@ -6,6 +6,8 @@ import {
   STATUS_ROUTE,
   currentRestartPlan,
   isLoopbackAddress,
+  kickstartLaunchd,
+  launchdRestartPlan,
 } from './restart.js'
 
 export const name = 'dsh-web-restart'
@@ -131,12 +133,32 @@ export function apply(ctx) {
           })
           return
         }
+        // 优先交给 launchd：本机若用 LaunchAgent（KeepAlive）托管 `dsh web`，
+        // 我们再自己 spawn 一个就会和它抢端口 → EADDRINUSE → 无限重启。
+        const launchd = launchdRestartPlan()
+        if (launchd) {
+          const started = kickstartLaunchd(launchd.label)
+          if (started.ok) {
+            sendJson(res, 202, {
+              ok: true,
+              scheduled: true,
+              bootId: BOOT_ID,
+              via: 'launchd',
+              label: started.label,
+              target: started.target,
+            })
+            return
+          }
+          // launchctl 起不来就退回原来的 helper 流程，别让用户卡死
+        }
+
         const plan = currentRestartPlan()
         const helperPid = spawnHelper(plan)
         sendJson(res, 202, {
           ok: true,
           scheduled: true,
           bootId: BOOT_ID,
+          via: 'helper',
           helperPid,
           port: plan.port,
         })
